@@ -83,7 +83,7 @@ Surová vrstva obsahuje neupravené dáta z pôvodnej štruktúry datasetu, zná
 Z pôvodného ERD som vytvorila Star schému, ktorá obsahuje 1 tabuľku faktov:
 * `fact_company_events` - jednotlivé firemné udalosti a odvodené metriky
   - fact_id - primárny kľúč
-  - company_id, event_type_id, date_id, time_id - cudzie kľúče
+  - company_sk, event_type_id, date_id, time_id - cudzie kľúče
   - event_count – počet udalostí (hodnota 1 pre každý záznam), používaná na agregácie
   - events_per_year – počet udalostí spoločnosti za daný rok (vypočítané pomocou window function `COUNT(*) OVER`)
   - days_since_prev_event – počet dní od predchádzajúcej udalosti danej spoločnosti (vypočítané pomocou window function `LAG() OVER`)
@@ -91,18 +91,14 @@ Z pôvodného ERD som vytvorila Star schému, ktorá obsahuje 1 tabuľku faktov:
     
 napojenú na 4 dimenzie:
 * `dim_event_type` - klasifikačné informácie o type udalosti (typ transkriptu, fiškálneho obdobie)
-  - SCD typ 1: zmeny v klasifikácii udalostí sa prepisujú bez zachovania histórie, keďže historická verzia klasifikácie nie je analyticky relevantná
 * `dim_company` - základné identifikačné informácie o spoločnostiach, ako je názov, úroveň entity, identifikátory
-  - SCD typ 2: zmeny v atribútoch spoločnosti (napr. zmena primárnej burzy, tickra alebo úrovne entity) sú historicky významné, preto sa uchovávajú nové záznamy s platnosťou v čase
 * `dim_date` - informácie o dátumoch udalostí (od roku až po deň v týždni)
-  - SCD typ 0: hodnoty v dimenzii dátumu sú nemenné a nikdy sa neaktualizujú
 * `dim_time` - informácie o čase udalostí (od konkrétneho času až po sekundu)
-  - SCD typ 0: hodnoty v dimenzii času sú nemenné a nikdy sa neaktualizujú
 
 Samotná štruktúra hviezdicovej schémy je znázornená na diagrame nižšie, kde môžeme pozorovať jednotlivé vzťahy a prepojenia medzi tabuľkami. Môžeme si taktiež všimnúť, že niektoré údaje z pôvodnej ERD scény sme vynechali, keďže nie sú relevantné pre našu analýzu udalostí a zlepší sa tak prehľadnosť.
 
 <p align="center">
-  <img width="803" height="536" alt="Star_schema_Company" src="https://github.com/user-attachments/assets/4ee13c5c-a0df-4b29-8d7b-8fa2df804c2d" />
+  <img width="803" height="547" alt="Star_schema_Company" src="https://github.com/user-attachments/assets/7f19e4c0-b69f-4e85-82a8-5792ba6840db" />
   <br>
   <em>Obrázok 2 – Star schéma pre Company dataset</em>
 </p>
@@ -126,16 +122,155 @@ V tejto časti sa spájajú fázy Extract a Load – dôvodom je, že nepoužív
 
 Tu sme si vytvorili staging tabuľky (čo je vlastne Load fáza), do ktorých boli importované surové dáta z pôvodného datasetu (takže select je Extract fáza), čiže sa obe fázy stanú v jednom kóde.
 Po vytvorení Star schémy a ujasnení si, čo bude naša fact tabuľka, sme prišli na to, že nám stačí vytvoriť 2 staging tabuľky z company_index a company_event_transcript_attributes.
-Extrakcia a načítanie dát bola zabezpečená kódom (príklad):
+Extrakcia a načítanie dát bola zabezpečená kódom:
 
 ```sql
 CREATE OR REPLACE TABLE company_index_staging AS
 SELECT * FROM snowflake_public_data_free.public_data_free.company_index;
-```
 
+CREATE OR REPLACE TABLE company_event_transcript_attributes_staging AS
+SELECT *
+FROM snowflake_public_data_free.public_data_free.company_event_transcript_attributes;
+```
+<br>
 ### **3.2 Transform**
 
-V transformačnej fáze čistíme a obohacujeme dáta zo staging tabuliek. Cieľom je, podľa našej Star schémy, vytvoriť tabuľku faktov a tabuľky dimenzii
+V transformačnej fáze čistíme a obohacujeme dáta zo staging tabuliek. Cieľom je, podľa nášho  viacdimenzionálneho modelu Star schema, vytvoriť tabuľku faktov a tabuľky dimenzii. Vďaka nim budeme môcť neskôr robiť efektívnu analýzu udalostí a ich následnú vizualizáciu.
+Tabuľky dimenzíí nemali prirodzený primárny kľúč, tak sme si vytvorili surogátny kľúč, ktorý neskôr uľahčí prácu s tabuľkami (napr. aj keby v budúcnosti cheme implementovať históriu záznamov - SCD 2-4)
+
+- `dim_company` obsahuje údaje o spoločnostiach vrátane názvu, typu entity, identifikátorov ako EIN, CIK či permID a pole LEI. Použitie SCD Typ 1 znamená, že pri zmene údajov o spoločnosti sa staré hodnoty prepíšu novými. História zmien sa nesleduje – vždy sa uchováva len aktuálny stav.
+`company_sk` som pre úplnosť pridala ako surogate key, a `company_id` je business key (originálny identifikátor).
+
+```sql
+CREATE OR REPLACE TABLE dim_company (
+    company_sk INT AUTOINCREMENT PRIMARY KEY,   
+    company_id VARCHAR(32),                      
+    company_name VARCHAR(1000),
+    entity_level VARCHAR(255),
+    ein VARCHAR(255),
+    cik VARCHAR(255),
+    lei array,
+    permid_company_id VARCHAR(255)
+);
+
+INSERT INTO dim_company (company_id, company_name, entity_level, ein, cik, lei, permid_company_id)
+SELECT DISTINCT company_id, company_name, entity_level, ein, cik, lei, permid_company_id
+FROM company_index_staging;
+```
+
+- `dim_event_type` uchováva typy udalostí, typ transcriptu, fiškálne obdobie a rok. Táto dimenzia je tiež typu SCD Typ 0, pretože definície typov udalostí sa nemenia. Tiež je definovaná ako SCD Typ 1, pretože ak sa definícia typu udalosti alebo fiškálneho obdobia zmení, existujúci záznam sa jednoducho aktualizuje bez uchovávania histórie.
+
+```sql
+CREATE OR REPLACE TABLE dim_event_type (
+    event_type_id INT AUTOINCREMENT PRIMARY KEY,
+    event_type VARCHAR(255),
+    transcript_type VARCHAR(255),
+    fiscal_period VARCHAR(255),
+    fiscal_year VARCHAR(255)
+);
+
+INSERT INTO dim_event_type (event_type, transcript_type, fiscal_period, fiscal_year)
+SELECT DISTINCT event_type, transcript_type, fiscal_period, fiscal_year
+FROM company_event_transcript_attributes_staging;
+```
+
+- `dim_date` - uchováva informácie o dátumoch udalostí. Obsahuje odvodené údaje ako deň, mesiac, rok, štvrťrok a deň v týždni. Dimenzia je typu SCD Typ 0, pretože dátumy sú nemenné.
+
+```sql
+CREATE OR REPLACE TABLE dim_date (
+    date_id INT AUTOINCREMENT PRIMARY KEY,
+    date DATE,
+    year INT,
+    month INT,
+    day INT,
+    quarter INT,
+    weekday INT
+);
+
+INSERT INTO dim_date (date, year, month, day, quarter, weekday)
+SELECT DISTINCT
+    TO_DATE(event_timestamp) AS date,
+    YEAR(event_timestamp) AS year,
+    MONTH(event_timestamp) AS month,
+    DAY(event_timestamp) AS day,
+    QUARTER(event_timestamp) AS quarter,
+    DAYOFWEEK(event_timestamp) AS weekday
+FROM company_event_transcript_attributes_staging;
+```
+
+- `dim_time` - uchováva informácie o čase udalosti, vrátane hodiny, minúty, sekundy a AM/PM označenia. Táto dimenzia je tiež typu SCD Typ 0.
+```sql
+CREATE OR REPLACE TABLE dim_time (
+    time_id INT AUTOINCREMENT PRIMARY KEY,
+    time TIME,
+    hour INT,
+    minute INT,
+    second INT,
+    am_pm CHAR(2)
+);
+
+INSERT INTO dim_time (time, hour, minute, second, am_pm)
+SELECT DISTINCT
+    CAST(event_timestamp AS TIME) AS time,
+    EXTRACT(HOUR FROM event_timestamp) AS hour,
+    EXTRACT(MINUTE FROM event_timestamp) AS minute,
+    EXTRACT(SECOND FROM event_timestamp) AS second,
+    CASE WHEN EXTRACT(HOUR FROM event_timestamp) < 12 THEN 'AM' ELSE 'PM' END AS am_pm
+FROM company_event_transcript_attributes_staging;
+```
+
+- Faktová tabuľka `fact_company_events` obsahuje záznamy o jednotlivých udalostiach a prepojenia na všetky dimenzie. Obsahuje navyše metriky, ako je počet udalostí, počet udalostí za rok a počet dní od predchádzajúcej udalosti.
+
+```sql
+CREATE OR REPLACE TABLE fact_company_events (
+    fact_id INT AUTOINCREMENT PRIMARY KEY,
+    company_sk INT,
+    event_type_id INT,
+    date_id INT,
+    time_id INT,
+    event_count INT,
+    events_per_year INT,
+    days_since_prev_event INT
+);
+
+INSERT INTO fact_company_events (company_sk, event_type_id, date_id, time_id, event_count, events_per_year, days_since_prev_event)
+SELECT
+    c.company_sk,
+    et.event_type_id,
+    d.date_id,
+    t.time_id,
+    1 AS event_count, 
+    
+    COUNT(*) OVER (PARTITION BY c.company_sk, et.event_type_id, d.year) AS events_per_year,
+    
+    DATEDIFF(
+        day,
+        LAG(e.event_timestamp) OVER (PARTITION BY c.company_sk, et.event_type_id ORDER BY e.event_timestamp),
+        e.event_timestamp
+    ) AS days_since_prev_event
+    
+FROM company_event_transcript_attributes_staging e
+JOIN dim_company c
+    ON e.company_id = c.company_id
+JOIN dim_event_type et
+    ON e.event_type = et.event_type
+   AND e.transcript_type = et.transcript_type
+   AND e.fiscal_period = et.fiscal_period
+   AND e.fiscal_year = et.fiscal_year
+JOIN dim_date d
+    ON TO_DATE(e.event_timestamp) = d.date
+JOIN dim_time t
+    ON CAST(e.event_timestamp AS TIME) = t.time;
+```
+
+Po vytvorení potrebných tabuliek dimenzii a faktu, a nahraní potrebných dát, odstránime staging tabuľky, aby sme zbytočne nezahlcovali úložisko:
+```sql
+DROP TABLE IF EXISTS company_event_transcript_attributes_staging;
+DROP TABLE IF EXISTS company_index_staging;
+```
+<br>
+
+## **4. Vizualizácia dát**
 
 
 
